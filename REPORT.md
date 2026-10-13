@@ -163,7 +163,7 @@ for each, and I chose the most cautious one, `0.1`. In short, with 4 features an
 five decimals (standardized features; order is `pd5_diff`, `pd16_diff`,
 `rest_diff`, `div_game`, bias):
 `0.2719, 0.4715, 0.0446, -0.0614, 0.2857`. The largest difference in predicted
-probability between any two methods on the test set is 1.4e-6, which comes from
+probability between any two methods on the test set is 1.5e-6, which comes from
 `float32` (PyTorch) against `float64` (scikit-learn) and from different stopping
 rules (lbfgs against 3,000 gradient steps). I expected agreement: the logistic
 objective with an L2 penalty is convex, so there is one optimum, and I forced
@@ -190,7 +190,49 @@ implemented the maths correctly, not that the model is good.
 
 ## Limitations & next steps
 
-*(to complete)*
+1. **The business gain is small and not statistically solid.** At the 0.75
+   threshold the model costs 418 against 442 for "never rest", a saving of 24.
+   A bootstrap over the 815 test games gives a 95% interval of about -9 to +54
+   for that saving, so I cannot claim the model beats the simple policy with
+   confidence (it won in about 92% of resamples). With 815 games, accuracy also
+   carries a standard error of about 1.7 points. *Next step:* evaluate on more
+   seasons as they are played, and report intervals rather than single numbers.
+2. **The costs (3 and 1) are invented**, and the 0.75 threshold follows directly
+   from them. If the real cost of a lost game were, say, 5 times a fatigue risk,
+   the threshold would be 0.83. The dashboard lets you change the costs, but the
+   true values would have to come from the club (standings impact, injury
+   data). *Next step:* ask a team analyst for realistic cost estimates.
+3. **The model overestimates home advantage in recent seasons.** It predicts a
+   56.9% home win rate on average in the test set, against 54.2% observed. The
+   intercept was learned mostly from older seasons (home win rate 56.4%).
+   Among the 100 games where it recommends resting, the home team did win 81%,
+   so the decision area is reasonably calibrated, but the overall bias is
+   visible. *Next step:* weight recent seasons more, or recalibrate the
+   intercept on the most recent seasons.
+4. **The features ignore who the opponent was and who is playing.** A margin of
+   +10 against weak teams counts the same as +10 against strong ones, and the
+   data has the starting quarterback of each game (`home_qb_id`) but I did not
+   use it, though a quarterback change is one of the biggest swings in a team's
+   strength. *Next step:* opponent-adjusted margins (or an Elo-style rating,
+   which I tested and which performed comparably) and a "starting quarterback
+   changed" flag.
+5. **One validation season is a noisy basis for tuning.** 2022 has 269 games,
+   and the validation loss was flat for every regularization strength above
+   `C = 1` and for every learning rate I tried, so tuning decided almost nothing.
+   *Next step:* rolling-origin cross-validation across several seasons.
+6. **A linear model cannot capture interactions** (for example, rest mattering
+   more when travelling). Rest and division had near-zero weights, and I kept
+   them because of their football logic rather than their evidence. *Next step:*
+   drop them or test interactions, and compare with a tree-based model, which
+   is outside this assignment's scope.
+7. **The decision scenario is stylized.** Real rest decisions depend on
+   standings, injuries and playoff seeding, and are made player by player, not
+   game by game. The model estimates a win probability; turning that into a
+   rotation policy needs football input I do not have.
+8. **The test set is not perfectly clean.** While exploring features I printed
+   test-set numbers as well as validation ones (see the feature engineering
+   section). I chose features using validation results and simplicity, but a
+   fully strict workflow would have hidden the test set until the end.
 
 ## Generative AI use disclosure
 
