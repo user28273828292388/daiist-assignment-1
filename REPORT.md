@@ -113,7 +113,80 @@ on validation results and simplicity.
 
 ## Modeling: three implementations, one model
 
-*(to complete)*
+**Model: logistic regression**, because the target is binary (home win yes/no)
+and the output is a probability I can compare to the 0.75 cost-based threshold.
+`probability = sigmoid(X @ w + b)`, trained by minimizing mean binary
+cross-entropy plus an L2 penalty `(lambda / 2) * sum(w^2)` on the weights (not the
+bias).
+
+**Three implementations on the same split and features:**
+
+1. **scikit-learn** `LogisticRegression` (lbfgs solver).
+2. **Manual PyTorch loop** (Session 5): raw tensors, a hand-written BCE loss,
+   `loss.backward()`, an update `w -= lr * w.grad` inside `torch.no_grad()`, and
+   `grad.zero_()` after every step.
+3. **Standard PyTorch**: `nn.Sequential(nn.Linear, nn.Sigmoid)`, `nn.BCELoss`,
+   `torch.optim.SGD`.
+
+**What I set equal so the three could be compared fairly:**
+
+- **Same objective.** scikit-learn's `C` is the inverse of the penalty. With
+  `n` training rows, the equivalent for a mean loss is `lambda = 1 / (C * n)`.
+  In method 2 I add the penalty to the loss explicitly; in method 3 I use
+  `weight_decay=lambda` on the weights only (the bias sits in a separate
+  parameter group with no decay). `weight_decay` adds `lambda * w` to the
+  gradient, which is the gradient of the penalty.
+- **Same optimizer and starting point.** Both PyTorch versions use plain
+  full-batch gradient descent (no momentum, no Adam), 3,000 epochs, and weights
+  and bias initialized at zero (`nn.Linear` would otherwise start random).
+- **Same inputs.** Standardized features, same split.
+
+**Hyperparameters (the only two I tuned, on the 2022 validation season).**
+`C` from {0.001 ... 100}: validation log loss is flat from `C = 1` upwards
+(0.64484 vs 0.64483), so I chose `C = 1.0`, the strongest regularization within
+noise (differences under 5e-5 are treated as ties). Learning rate from
+{0.1, 0.5, 1, 2}: all four reach the same validation loss, so training converges
+for each, and I chose the most cautious one, `0.1`. In short, with 4 features and
+5,868 training games, regularization and learning rate barely matter.
+
+**Results on the test set (2023-2025, 815 games):**
+
+| | Accuracy @0.5 | Log loss | AUC | Cost @0.75 | False pos. | False neg. | Games rested |
+|---|---|---|---|---|---|---|---|
+| scikit-learn | 0.6319 | 0.6386 | 0.6896 | 418 | 19 | 361 | 100 |
+| Manual PyTorch | 0.6319 | 0.6386 | 0.6896 | 418 | 19 | 361 | 100 |
+| nn.Module + optim | 0.6319 | 0.6386 | 0.6896 | 418 | 19 | 361 | 100 |
+| Baseline: always predict home win | 0.5423 | 0.6905 (train win rate) | - | 1,119 (always rest) | - | - | 815 |
+| Baseline: never rest starters | - | - | - | 442 | 0 | 442 | 0 |
+
+**Do the three agree? Yes.** All three learn the same coefficients to four or
+five decimals (standardized features; order is `pd5_diff`, `pd16_diff`,
+`rest_diff`, `div_game`, bias):
+`0.2719, 0.4715, 0.0446, -0.0614, 0.2857`. The largest difference in predicted
+probability between any two methods on the test set is 1.4e-6, which comes from
+`float32` (PyTorch) against `float64` (scikit-learn) and from different stopping
+rules (lbfgs against 3,000 gradient steps). I expected agreement: the logistic
+objective with an L2 penalty is convex, so there is one optimum, and I forced
+the three methods to minimize the same function from the same point. The three
+could have disagreed if I had left the penalty out of one of them, used Adam in
+one and plain gradient descent in the other, forgotten `grad.zero_()`, or skipped
+the scaling. I did not need to debug a disagreement, but note that these three
+methods are the same model with different bookkeeping, so agreement shows I
+implemented the maths correctly, not that the model is good.
+
+**Reading the numbers against the business framing.**
+
+- The model beats the naive baseline on every statistic: accuracy 63.2% against
+  54.2%, and log loss 0.639 against 0.691.
+- The coefficients make football sense: the longer-run margin (`pd16_diff`,
+  0.47) matters most, then recent form (`pd5_diff`, 0.27). Rest and division
+  barely matter, as the correlations suggested.
+- **The business gain is real but small.** At the 0.75 threshold the model rests
+  starters in only 100 of 815 games, and 19 of those are losses. Total cost is
+  418, against 442 for the best naive policy (never rest starters), a reduction
+  of about 5%. "Always rest" costs 1,119, much worse. Because the home team wins
+  only 54% of the time and the threshold is 0.75, the sensible naive policy is
+  to never rest, and that is the bar the model has to clear.
 
 ## Limitations & next steps
 

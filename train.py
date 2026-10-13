@@ -1,5 +1,5 @@
 """
-Assignment 1 — training pipeline (PART 2: features, leakage check, scaled arrays).
+Assignment 1 — training pipeline (PART 3: three models, comparison, saved artifacts).
 
 Business question: will the HOME team win this regular-season NFL game?
 Decision it supports: if the model is confident the home team wins, the coach
@@ -9,14 +9,21 @@ rests starters. Costs (invented, see REPORT.md):
 => predict "win" only when P(win) > COST_FP / (COST_FP + COST_FN) = 0.75
 """
 
+import json
 from pathlib import Path
 
+import joblib
 import numpy as np
 import pandas as pd
+import torch
+import torch.nn as nn
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, log_loss, roc_auc_score
 from sklearn.preprocessing import StandardScaler
 
 ROOT = Path(__file__).resolve().parent
 DATA_PATH = ROOT / "data" / "nfl_games.csv"
+ARTIFACTS = ROOT / "artifacts"      # everything app.py needs; created by this script
 
 # --- Business framing, written as constants so every later step uses them ---
 COST_FP = 3.0   # rest starters, then lose
@@ -148,19 +155,214 @@ def prepare_data():
     return data, (train, val, test)
 
 
-def main() -> None:
-    data, (train, val, test) = prepare_data()
+# ----------------------------------------------------------------------------
+# 4. The same model three ways: logistic regression, L2-regularized
+#
+#    probability = sigmoid(X @ w + b)
+#    objective   = mean binary cross-entropy + (lam / 2) * sum(w**2)   (b is not penalized)
+#
+#    scikit-learn's C is the inverse of the penalty:  lam = 1 / (C * n_train).
+#    I use that conversion so all three methods minimize the SAME objective.
+# ----------------------------------------------------------------------------
+C_GRID = [0.001, 0.01, 0.1, 1.0, 10.0, 100.0]     # tuned on validation (sklearn)
+LR_GRID = [0.1, 0.5, 1.0, 2.0]                    # tuned on validation (manual loop)
+EPOCHS = 3000                                     # full-batch gradient descent
+TIE_TOLERANCE = 5e-5   # validation log-loss differences below this are treated as noise
 
-    print(f"\nFeatures used: {FEATURES}")
-    for name, part in [("train", train), ("val", val), ("test", test)]:
-        print(
-            f"{name:>5}: {len(part):5d} games | seasons {part['season'].min()}-{part['season'].max()}"
-            f" | home win rate {part['home_win'].mean():.3f}"
-        )
-    print("\nCorrelation of each feature with home_win (train):")
-    print(train[FEATURES + ["home_win"]].corr()["home_win"].drop("home_win").round(3).to_string())
-    print(f"\nDecision threshold from costs: {DECISION_THRESHOLD:.2f}")
-    print(f"Naive baseline (always home win) test accuracy: {(test['home_win'] == 1).mean():.3f}")
+
+def pick_simplest(scores: dict, prefer_small: bool = True):
+    """Among settings whose validation log loss is within TIE_TOLERANCE of the best,
+    take the smallest value: the strongest regularization (small C) or the most
+    cautious learning rate. Avoids picking a value by a 1e-6 difference."""
+    best = min(scores.values())
+    ok = [k for k, v in scores.items() if v <= best + TIE_TOLERANCE]
+    return min(ok) if prefer_small else max(ok)
+
+
+def fit_sklearn(X, y, C):
+    model = LogisticRegression(C=C, solver="lbfgs", tol=1e-10, max_iter=10_000)
+    return model.fit(X.astype(np.float64), y)
+
+
+def bce_loss(p, y):
+    """Binary cross-entropy written by hand (as in Session 5)."""
+    eps = 1e-7
+    p = p.clamp(eps, 1 - eps)
+    return -(y * torch.log(p) + (1 - y) * torch.log(1 - p)).mean()
+
+
+def fit_manual(X, y, lr, lam, epochs=EPOCHS):
+    """Method 2: raw tensors, autograd, manual gradient step (Session 5)."""
+    X, y = torch.tensor(X), torch.tensor(y)
+    w = torch.zeros(X.shape[1], requires_grad=True)
+    b = torch.zeros(1, requires_grad=True)
+    history = []
+    for _ in range(epochs):
+        p = torch.sigmoid(X @ w + b)
+        data_loss = bce_loss(p, y)
+        loss = data_loss + 0.5 * lam * (w ** 2).sum()   # explicit L2 penalty on w only
+        loss.backward()
+        with torch.no_grad():                           # the update is not part of the graph
+            w -= lr * w.grad
+            b -= lr * b.grad
+        w.grad.zero_()                                  # gradients accumulate otherwise
+        b.grad.zero_()
+        history.append(data_loss.item())
+    return w.detach(), b.detach(), history
+
+
+def fit_torch_module(X, y, lr, lam, epochs=EPOCHS):
+    """Method 3: nn.Module + torch.optim. Same maths as method 2; the library does
+    the bookkeeping. weight_decay=lam adds lam*w to the gradient, which is exactly
+    the gradient of (lam/2)*sum(w**2). The bias goes in its own group, unpenalized."""
+    X, y = torch.tensor(X), torch.tensor(y)
+    model = nn.Sequential(nn.Linear(X.shape[1], 1), nn.Sigmoid())
+    nn.init.zeros_(model[0].weight)                     # same start as method 2
+    nn.init.zeros_(model[0].bias)
+    optimizer = torch.optim.SGD(
+        [{"params": [model[0].weight], "weight_decay": lam},
+         {"params": [model[0].bias], "weight_decay": 0.0}],
+        lr=lr,
+    )
+    loss_fn = nn.BCELoss()
+    history = []
+    for _ in range(epochs):
+        optimizer.zero_grad()
+        loss = loss_fn(model(X).squeeze(-1), y)
+        loss.backward()
+        optimizer.step()
+        history.append(loss.item())
+    return model, history
+
+
+def predict_manual(w, b, X):
+    with torch.no_grad():
+        return torch.sigmoid(torch.tensor(X) @ w + b).numpy()
+
+
+def predict_module(model, X):
+    with torch.no_grad():
+        return model(torch.tensor(X)).squeeze(-1).numpy()
+
+
+# ----------------------------------------------------------------------------
+# 5. Evaluation: statistics AND the business cost at the 0.75 threshold
+# ----------------------------------------------------------------------------
+def business_cost(y, p, threshold=DECISION_THRESHOLD):
+    say_win = p >= threshold
+    fp = int(((say_win) & (y == 0)).sum())      # rested starters and lost
+    fn = int(((~say_win) & (y == 1)).sum())     # played starters, would have won
+    return COST_FP * fp + COST_FN * fn, fp, fn, int(say_win.sum())
+
+
+def evaluate(y, p):
+    cost, fp, fn, n_rest = business_cost(y, p)
+    return {
+        "accuracy@0.5": float(accuracy_score(y, p >= 0.5)),
+        "log_loss": float(log_loss(y, p)),
+        "auc": float(roc_auc_score(y, p)),
+        "cost@0.75": float(cost), "false_pos": fp, "false_neg": fn,
+        "games_rested@0.75": n_rest,
+    }
+
+
+def naive_baselines(y_train, y_test):
+    rate = float(y_train.mean())
+    p = np.full(len(y_test), rate)                   # always the training home-win rate
+    always_win = business_cost(y_test, np.ones(len(y_test)))[0]   # always rest starters
+    never_win = business_cost(y_test, np.zeros(len(y_test)))[0]   # never rest starters
+    return {
+        "accuracy_always_home_win": float(y_test.mean()),
+        "log_loss_train_rate": float(log_loss(y_test, p)),
+        "cost_always_rest": float(always_win),
+        "cost_never_rest": float(never_win),
+    }
+
+
+def main() -> None:
+    torch.manual_seed(0)
+    data, (train, val, test) = prepare_data()
+    X_tr, y_tr = data["X_train"], data["y_train"]
+    X_va, y_va = data["X_val"], data["y_val"]
+    X_te, y_te = data["X_test"], data["y_test"]
+    n_train = len(y_tr)
+
+    print(f"\nFeatures: {FEATURES}")
+    print(f"train {len(y_tr)} | val {len(y_va)} | test {len(y_te)} games")
+
+    # --- Tune ONLY the regularization strength (on validation) ---
+    val_ll = {C: log_loss(y_va, fit_sklearn(X_tr, y_tr, C).predict_proba(X_va.astype(np.float64))[:, 1])
+              for C in C_GRID}
+    best_C = pick_simplest(val_ll)
+    lam = 1.0 / (best_C * n_train)
+    print("\nValidation log loss by C:", {C: round(v, 5) for C, v in val_ll.items()})
+    print(f"Chosen C = {best_C}  ->  lambda = 1/(C*n) = {lam:.3e}")
+
+    # --- Tune ONLY the learning rate (on validation, manual loop) ---
+    lr_ll = {}
+    for lr in LR_GRID:
+        w, b, _ = fit_manual(X_tr, y_tr, lr, lam)
+        lr_ll[lr] = log_loss(y_va, predict_manual(w, b, X_va))
+    best_lr = pick_simplest(lr_ll)
+    print("Validation log loss by learning rate:", {k: round(v, 6) for k, v in lr_ll.items()})
+    print(f"Chosen learning rate = {best_lr} ({EPOCHS} epochs, full batch)")
+
+    # --- Train the three methods with identical settings ---
+    sk = fit_sklearn(X_tr, y_tr, best_C)
+    w_m, b_m, hist_m = fit_manual(X_tr, y_tr, best_lr, lam)
+    net, hist_n = fit_torch_module(X_tr, y_tr, best_lr, lam)
+
+    preds = {
+        "sklearn": sk.predict_proba(X_te.astype(np.float64))[:, 1],
+        "manual_torch": predict_manual(w_m, b_m, X_te),
+        "nn_module": predict_module(net, X_te),
+    }
+    coefs = {
+        "sklearn": list(sk.coef_[0]) + [float(sk.intercept_[0])],
+        "manual_torch": w_m.tolist() + [float(b_m)],
+        "nn_module": net[0].weight.detach()[0].tolist() + [float(net[0].bias.detach())],
+    }
+
+    # --- Compare: do they agree? ---
+    table = {name: evaluate(y_te, p) for name, p in preds.items()}
+    base = naive_baselines(y_tr, y_te)
+    print(f"\n{'TEST SET (2023-2025)':<22}{'acc@0.5':>9}{'logloss':>9}{'AUC':>8}{'cost@.75':>10}{'FP':>5}{'FN':>5}{'rested':>8}")
+    for name, m in table.items():
+        print(f"{name:<22}{m['accuracy@0.5']:>9.4f}{m['log_loss']:>9.4f}{m['auc']:>8.4f}"
+              f"{m['cost@0.75']:>10.0f}{m['false_pos']:>5}{m['false_neg']:>5}{m['games_rested@0.75']:>8}")
+    print(f"{'baseline: always home':<22}{base['accuracy_always_home_win']:>9.4f}{base['log_loss_train_rate']:>9.4f}"
+          f"{'':>8}{base['cost_always_rest']:>10.0f}   (always rest starters)")
+    print(f"{'baseline: never rest':<22}{'':>9}{'':>9}{'':>8}{base['cost_never_rest']:>10.0f}   (never rest starters)")
+
+    print("\nCoefficients [pd5, pd16, rest, div, bias] (standardized features):")
+    for name, c in coefs.items():
+        print(f"  {name:<14}", np.round(c, 5))
+    names = list(preds)
+    print("\nMax |difference| in predicted probability on the test set:")
+    for i in range(3):
+        for j in range(i + 1, 3):
+            print(f"  {names[i]} vs {names[j]}: {np.abs(preds[names[i]] - preds[names[j]]).max():.2e}")
+
+    # --- Save everything app.py needs (it must never retrain) ---
+    ARTIFACTS.mkdir(exist_ok=True)
+    joblib.dump(sk, ARTIFACTS / "sklearn_model.joblib")
+    joblib.dump(data["scaler"], ARTIFACTS / "scaler.joblib")
+    torch.save({"w": w_m, "b": b_m}, ARTIFACTS / "manual_model.pt")
+    torch.save(net.state_dict(), ARTIFACTS / "torch_model.pt")
+    all_games = pd.concat([train.assign(split="train"), val.assign(split="val"), test.assign(split="test")])
+    cols = ["game_id", "season", "week", "gameday", "home_team", "away_team", "split", "home_win"] + FEATURES
+    all_games[cols].to_csv(ARTIFACTS / "dataset.csv", index=False)
+    metrics = {
+        "features": FEATURES, "cost_fp": COST_FP, "cost_fn": COST_FN,
+        "decision_threshold": DECISION_THRESHOLD, "C": best_C, "lambda": lam,
+        "learning_rate": best_lr, "epochs": EPOCHS, "n_train": n_train,
+        "val_log_loss_by_C": {str(k): v for k, v in val_ll.items()},
+        "val_log_loss_by_lr": {str(k): v for k, v in lr_ll.items()},
+        "test": table, "baselines": base, "coefficients": coefs,
+        "loss_history": {"manual_torch": hist_m, "nn_module": hist_n},
+    }
+    (ARTIFACTS / "metrics.json").write_text(json.dumps(metrics, indent=2))
+    print(f"\nSaved models, scaler, dataset and metrics to {ARTIFACTS.name}/")
 
 
 if __name__ == "__main__":
