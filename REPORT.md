@@ -235,5 +235,4 @@ implemented the maths correctly, not that the model is good.
    fully strict workflow would have hidden the test set until the end.
 
 ## Generative AI use disclosure
-
-*(to complete, honestly: what you used and how)*
+I used Claude (Anthropic) as an assistant throughout this assignment: to compare candidate datasets and choose the NFL games data, to draft the code in train.py and app.py, to draft the text of this report, and to guide me through the Git and GitHub steps. I ran the code on my own machine using Visual Studio Code and checked that my outputs matched the results reported here. The cost values (3 and 1) were chosen with Claude’s help and are invented for the exercise.
