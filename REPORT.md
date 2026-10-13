@@ -62,7 +62,54 @@ matrix and the total cost change.
 
 ## Data preparation & feature engineering
 
-*(to complete)*
+**Rule that drives everything: a feature for game *i* may only use games played
+before *i*.** The raw file has no "team strength" column, so I built it from past
+results. For every team and every game I computed the team's average point margin
+(points scored minus points allowed) over its previous games, using
+`shift(1)` so the current game is excluded, and then took **home minus away**.
+
+| Feature | What it measures | Why |
+|---|---|---|
+| `pd5_diff` | Home minus away average point margin, last 5 games | Recent form |
+| `pd16_diff` | Same, last 16 games (about one season) | Underlying strength, less noisy than 5 games |
+| `rest_diff` | Home rest days minus away rest days | A team with more rest should be fresher |
+| `div_game` | 1 if both teams share a division | Rivals know each other, so games may be closer |
+
+Correlation with winning in the training set: `pd5_diff` 0.28, `pd16_diff` 0.30,
+`rest_diff` 0.02, `div_game` -0.03. The two margin features carry the signal;
+rest and division are kept because they have a clear football logic, but I expect
+their weights to be small and I report that rather than hide it.
+
+**Proof of no leakage.** `check_no_future_leakage` in `train.py` scrambles the
+scores of every game from the first test day onward and checks that the features
+of games on that day do not change, while the features of later games do. It
+runs every time `main.py train` runs.
+
+**Data-quality decisions**
+
+- Both margin features are undefined for a team's very first game in the data
+  (1999 week 1). I fill them with 0 (an average team). This affects only the
+  first game of each team.
+- `temp` and `wind` are missing in 1,982 of the 6,952 games, mostly because
+  roofed stadiums do not record them. `surface` has nine spellings, including
+  `grass` and `grass ` (with a trailing space). I tried adding indoor/outdoor,
+  grass/turf, temperature and wind (imputing outdoor medians from the training
+  set). On an earlier four-feature version, validation accuracy went from 0.613
+  to 0.602 and log loss did not improve, so I **left the weather and surface
+  features out**.
+- **Scaling:** features are standardized with a `StandardScaler` fitted on the
+  training set only, then applied to validation and test. Scaling matters here
+  because the manually written gradient descent converges poorly on features
+  with different scales.
+
+**What I tried and did not keep.** A longer or shorter window on its own, a
+season-to-date margin, and an Elo-style rating all gave similar results. I chose
+the 5-plus-16 game combination because it did better on the 2022 validation
+season (accuracy 0.639 against 0.613 for a 5-game win rate plus margin) and is
+easy to explain. Elo performed comparably but is harder to explain and defend.
+In the interest of honesty: my exploration scripts also printed test-set
+numbers, so the test set is not perfectly untouched. The final choice was made
+on validation results and simplicity.
 
 ## Modeling: three implementations, one model
 
